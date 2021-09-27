@@ -23,7 +23,7 @@
 
   It is now clear that none of my LAS-based systems are paying attention to the acoustics.  This problem was mentioned in the LAS paper, but the solution given, using the attention mechanism, is already in place in my system.  Possibly I have this problem because I have so much less training data than was used in the paper.  Possibly it is because my training sentences are too long; Figure 4 in the paper shows a data distribution whose mode is only 3 words long, mine is 37.  Possible solutions include curriculum learning, location-sensitive attention, and perhaps introducing information bottlenecks into the decoder as used in <a href="https://arxiv.org/abs/1712.05884">Tacotron 2</a>.
 
-
+TODO : this page and its systems need revisiting in the light of improvements made to my LAS system.
 
 
 

@@ -1,5 +1,5 @@
 # Pyramidal Transformer Attend Spell speech recognition model - research.
-# Written Aug-Sep 2021.
+# Written Aug-Oct 2021 (v5).
 
 
 import os
@@ -28,25 +28,28 @@ tf.random.set_seed(1)
 
 # data
 mel_dim      = 40    # free choice, number of logmels
-max_len      = 1700  # max frames, must be >= loglim from filter_lengths() below
+max_frames   = 1700  # free choice, ultimately limited by GPU memory, see filter_lengths()
 voc_dim      = 123   # one more than the highest unicode value in the vocabulary, which is 122 for 'z'.
                      # the vocab is {a,b,c...z,0...9,<space>,<comma>,<period>,<apost>,<unk>} + {<sos>,<eos>}
                      # where <unk> is ?, <sos> is ^, and <eos> is $.
 sample_rate  = 16000 # from LibriSpeech
 # model
-lis_dim      = 256   # free choice, (half of the) listener output dimension
-lis_layers   = 3     # free choice, number of layers in the listener (Transformer)
-ffn_dim      = 1280  # free choice, Transformer feed forward network dimension
+lis_dim      = 256   # free choice, listener dimension (half of Transformer dimension)
+lis_layers   = 3     # free choice, number of layers in the Transformer
+ffn_dim      = 1408  # free choice, PyramidalTransformer feed forward network dimension
 nheads       = 8     # free choice, number of Transformer heads
 dropout_rate = 0.1   # free choice, dropout rate in Transformer
-dec_dim      = 512   # free choice, dimension of the DecoderCell's internal LSTMs
-att_dim      = 512   # free choice, dimension of DecoderCell MLPs used to compute attention queries and keys
+dec_dim      = 512   # free choice, dimension of the DecoderCell's internal LSTM
+att_dim      = 512   # free choice, dimension of MLPs used to compute attention queries and keys
 # training
-norm_count   = 1000  # free choice, the number of normalization adaptation examples, 1000 takes 47s
+norm_count   = 1000  # free choice, the number of normalization adaptation examples, 1000 takes < 1 minute
 frac_pyp     = 0.1   # free choice, the fraction of previous y predictions to use as y input
-                     # This enables me to train as in the LAS paper, either with frac_pyp = 0 or 0.1
+                     # This enables me to train as in the paper, either with frac_pyp = 0 or frac_pyp = 0.1
+mloss_wt     = 0.0   # free choice, the monotonicity loss weight, a multiplier
 batch_size   = 4     # Limited by the amount of memory in the GPU; most efficiently a power of 2
-num_epochs   = 3     # free choice; 3 epochs takes ~9 hours on my machine
+max_chars    = 300   # free choice, maximum number of characters allowed in training data (capped at 300)
+num_epochs   = 3     # free choice, number of epochs of training
+
 # decoding
 max_dec      = 300   # free choice, maximum number of characters to decode for if <eos> token is not found
 
@@ -65,9 +68,69 @@ info     = builder.info
 train_ds = builder.as_dataset(split="train_clean100")
 
 
+# Filter out examples longer than I want to use.
+# There are a few extremely long examples that cause training to fall over (exceed GPU memory).
+# Speech length 17s and text length 300 were chosen to exclude less than 0.5% of my data (using < not <=).
+# This enabled me to run an early system with batch_size=8 on my machine.
+# The tf.minimum allows max_chars to override the 300 character machine limit.
+# This function comes first in the pipeline so I don't waste time processing speech I'm not going to use.
+@tf.autograph.experimental.do_not_convert
+def filter_lengths(d):
+    speech    = d['speech']                      # (samples,)
+    text      = d['text']                        # ()
+    speechl   = tf.shape(speech)[0]
+    textl     = tf.strings.length(text)
+    # the adjustment for 2**lis_layers allows for possible padding in wav_augment() below
+    # max_frames should exceed the number of frames ever created; it is used to size positional encoding
+    speechlim = (max_frames - 2**lis_layers) * 10 * (sample_rate // 1000)
+    textlim   = tf.minimum(max_chars, 300)
+    return tf.math.logical_and(speechl <= speechlim, textl <= textlim)
+
+
+filt_ds = train_ds.filter(filter_lengths)
+
+
 # Shuffle the training dataset.
 # Buffer size 2048 adds about 4GB to the resident memory size (non GPU) taking it to 9GB.
-train_ds = train_ds.shuffle(2048, reshuffle_each_iteration=True, seed=1)
+shuf_ds = filt_ds.shuffle(256, reshuffle_each_iteration=True, seed=1)
+
+
+# map function to augment the waveform data by shifting, scaling, and adding noise
+@tf.autograph.experimental.do_not_convert
+def wav_augment(d):
+    wi = d['speech']         # -> (samples)
+    wf = tf.cast(wi, dtype=tf.float32)
+    # calculate the max_shift; with a 3-layer listener this will usually be 80ms = 1280 samples
+    frame_step = tf.constant(sample_rate * 10 // 1000)    
+    max_shift  = 2 ** lis_layers * frame_step 
+    # the waveform shift in samples is random in [0, max_shift)
+    shift = tf.random.uniform(shape=[], minval=0, maxval=max_shift, dtype=tf.int32, seed=1)
+    zeros = tf.zeros((shift,))
+    # the shifted waveform of floats
+    swf   = layers.concatenate([zeros, wf])
+    # the waveform scale is a float in [0.8, 1.0)
+    scale = tf.random.uniform(shape=[], minval=0.8, maxval=1.0, seed=1)
+    # the scaled shifted waveform of floats
+    sswf  = swf * scale
+    # the noise scale is a random float in [0, 1-scale)
+    noisescale = tf.random.uniform(shape=[], minval=0, maxval=1.0-scale, seed=1)
+    # the white noise is random floats on [0,1)
+    nsamples   = tf.shape(sswf)[0]
+    whitenoise = tf.random.uniform(shape=[nsamples], minval=0, maxval=1.0, seed=1)
+    # the actual noise is also scaled by the shifted speech waveform
+    # the idea is that some fraction of the signal already taken out is put back in as noise
+    # the 0.8 above results in the worst cases sounding slightly hissy
+    noise = swf * noisescale * whitenoise
+    ssnwf = sswf + noise
+    # cast back to int64s
+    nwi   = tf.cast(ssnwf, dtype=tf.int64)
+    # put back in the dict
+    d['speech'] = nwi
+    return d
+
+
+# apply waveform augmentation
+waug_ds = shuf_ds.map(wav_augment)
 
 
 # tfio versions compatible with TensorFlow 2.3.0 do not have tfio.audio.spectrogram()
@@ -107,7 +170,7 @@ def get_spectrogram(wt):
 
 
 # map function to convert the Librispeech Dataset dictionary into {logmels, speaker_id, ygt}
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def transform(d):
     wi = d['speech']         # -> (samples)
     wf = tf.cast(wi, dtype=tf.float32)
@@ -138,52 +201,36 @@ def transform(d):
 
 
 # convert the Librispeech elements into {logmels, speaker_id, ygt}
-new_ds = train_ds.map(transform)
-
-# Filter out a few extremely long examples that cause training to fall over (exceed GPU memory).
-# Parameters loglim and ygtlim have been chosen to exclude less than 0.5% of my data.
-# This enables me to run with batch_size=8 on my machine (pyramidal bi-LSTM Listener).
-# @tf.autograph.experimental.do_not_convert
-def filter_lengths(d):
-    logmels = d['logmels']         # (frames, mel_dim)
-    ygt     = d['ygt']             # (nchars, voc_dim)
-    logl    = tf.shape(logmels)[0]
-    ygtl    = tf.shape(ygt)[0]
-    loglim  = 1700
-    ygtlim  = 300
-    return tf.math.logical_and(logl < loglim, ygtl < ygtlim)
+logm_ds = waug_ds.map(transform)
 
 
-fil_ds = new_ds.filter(filter_lengths)
-
-
-# Normalization computes and stores means and variances for each logmel dimension.
+# The Normalization layer computes and stores means and variances for each logmel dimension.
 # Processing all of train_clean100 (~28,000 examples) takes a long time.
 # However, the mean and variance vectors don't change much after 100 examples.
 # The number to process is chosen with the training parameter norm_count.
 print('Computing data normalization vectors...')
 norm = preprocessing.Normalization(axis=-1)
-norm.adapt(fil_ds.take(norm_count).map(lambda d: d['logmels']))
+norm.adapt(logm_ds.take(norm_count).map(lambda d: d['logmels']))
 
 # normalize the logmels to have 0 mean and stdev 1 in each dimension
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def normalize(d):
     logmels = norm(d['logmels'])
     o = {'logmels' : logmels, 'speaker_id' : d['speaker_id'], 'ygt' : d['ygt']}
     return o
 
 
-nor_ds = fil_ds.map(normalize)
+norm_ds = logm_ds.map(normalize)
 
 
 # padded_batch pads all arrays with 0s to make rectangular tensors
-pad_ds = nor_ds.padded_batch(
+padd_ds = norm_ds.padded_batch(
     batch_size,
     padded_shapes=({'logmels' : (None, mel_dim), 'speaker_id' : (), 'ygt' : (None, voc_dim)}))
 
 
 # map function to add logmel and character masks to the training dataset
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def gen_masks(d):
     logmels = d['logmels']  # (batch, frames, mel_dim)
     # create a logmel mask where False indicates a padded value (0s in every logmel dimension)
@@ -199,7 +246,7 @@ def gen_masks(d):
     return d
 
 
-mask_ds = pad_ds.map(gen_masks)
+mask_ds = padd_ds.map(gen_masks)
 
 
 
@@ -216,50 +263,62 @@ class MultiHeadAttention(keras.layers.Layer):
     #
     # build is called automatically the first time __call__() is called
     def build(self, input_shape):
-        query_shape, value_shape = input_shape
-        # the last dimension of both the query and value tensors should be the same
-        assert(query_shape[-1] == value_shape[-1])
+        query_shape, value_shape, key_shape = input_shape
+        # the last dimension of the query and key tensors should be the same
+        assert(query_shape[-1] == key_shape[-1])
         # this is the model_dim
         self.model_dim = query_shape[-1]
         # compute the key (and query and value) dimension for each head
-        self.dk        = self.model_dim // self.nheads
-        # create query and value weights and scaled attention layers for each attention head
+        self.dk  = self.model_dim // self.nheads
+        # create query, value and key weights for each attention head
         self.qwl = []
         self.vwl = []
-        self.sal = []
+        self.kwl = []
         for h in range(self.nheads):
+            # use a Lecun normal initializer to obtain weight stdev 1/sqrt(model_dim)
+            # this means output stdev will be close to input stdev at initialization
+            # using the same seed produces three idential weight matrices at initialization
+            # this means that self-attention training begins with timesteps attending strongly to themselves
+            lecun = tf.keras.initializers.LecunNormal(seed=h)
             qw = self.add_weight(shape=(self.model_dim, self.dk),
-                                 initializer="random_normal",
+                                 initializer=lecun,
                                  name=f"mha_query{h}",
                                  trainable=True)
             vw = self.add_weight(shape=(self.model_dim, self.dk),
-                                 initializer="random_normal",
+                                 initializer=lecun,
                                  name=f"mha_value{h}",
                                  trainable=True)
-            sa = layers.Attention(use_scale=True)
+            kw = self.add_weight(shape=(self.model_dim, self.dk),
+                                 initializer=lecun,
+                                 name=f"mha_key{h}",
+                                 trainable=True)
             self.qwl.append(qw)
             self.vwl.append(vw)
-            self.sal.append(sa)
-        # and the output weight matrix applied to the concatenated head vector
+            self.kwl.append(kw)
+        # create the output weight matrix to be applied to the concatenated head vectors
+        lecun   = tf.keras.initializers.LecunNormal(seed=self.nheads)
         self.wo = self.add_weight(shape=(self.nheads * self.dk, self.model_dim),
-                                  initializer="random_normal",
+                                  initializer=lecun,
                                   name="mha_output",
                                   trainable=True)
     #
     #
-    # inputs should be a list of [query, value] tensors, each of shape (batch, timesteps, model_dim)
-    # keys are assumed to be equal to values (the usual case)
-    # mask should be a list of [query, value] masks where False means a pad
     def call(self, inputs, mask):
-        query, value = inputs
+        # inputs should be a list of [query, value, key] tensors, each of shape (batch, Tq/Tv, model_dim)
+        query, value, key = inputs
+        # mask should be a list of [query, value] masks where False means a pad, (batch, Tq/Tv)
+        qmask, vmask = mask
         # loop over heads
         hl = []
         for h in range(self.nheads):
-            # use the weight matrices for each head to compute that head's query and value tensors
+            # use the weight matrices for each head to compute that head's query, value and key tensors
             qi = tf.matmul(query, self.qwl[h])
             vi = tf.matmul(value, self.vwl[h])
-            # apply this head's scaled attention layer
-            hi = self.sal[h]([qi,vi], mask)
+            ki = tf.matmul(key,   self.kwl[h])
+            # scale the key values by 1/sqrt(dk) in lieu of doing it in the Attention() layer
+            ki = ki / np.sqrt(self.dk)
+            # apply attention to this head
+            hi = layers.Attention()([qi, vi, ki], [qmask, vmask])
             # add this head's output to the list
             hl.append(hi)
         # concatenate the individual head outputs (if necessary) along their last axis
@@ -275,6 +334,7 @@ class MultiHeadAttention(keras.layers.Layer):
         config = super(MultiHeadAttention, self).get_config()
         config.update({"nheads": self.nheads})
         return config
+
 
 
 class PyramidalTransformerLayer(keras.layers.Layer):
@@ -306,127 +366,126 @@ class PyramidalTransformerLayer(keras.layers.Layer):
         #
         # attention sub-layer
         # apply masked multi-head self-attention
-        sa = self.mha([inputs, inputs], [mask, mask])  # (batch, timesteps, layer_dim)
+        sa = self.mha([inputs, inputs, inputs], [mask, mask])  # (batch, timesteps, layer_dim)
         # dropout
-        p1 = self.dr1(sa, training=training)           # (batch, timesteps, layer_dim)
+        p1 = self.dr1(sa, training=training)                   # (batch, timesteps, layer_dim)
         # add and norm
         a1 = inputs + p1
-        n1 = self.nl1(a1)                              # (batch, timesteps, layer_dim)
+        n1 = self.nl1(a1)                                      # (batch, timesteps, layer_dim)
         #
         # pyramidal sub-layer
         # Take the n1 outputs and reshape them so as to combine pairs by concatenation
-        r1 = self.rl1(n1)                              # (batch, timesteps/2, layer_dim*2)
+        r1 = self.rl1(n1)                                      # (batch, timesteps/2, layer_dim*2)
         # similarly reshape the mask
-        rmask = self.rl2(mask)                         # (batch, timesteps/2, 2)
-        rmask = tf.reduce_all(rmask, axis=-1)          # (batch, timesteps/2)
+        rmask = self.rl2(mask)                                 # (batch, timesteps/2, 2)
+        rmask = tf.reduce_all(rmask, axis=-1)                  # (batch, timesteps/2)
         #
         # pointwise-feed-forward sub-layer
         # Take the r1 outputs and transform them back to layer_dim
-        d1 = self.dl1(r1)                              # (batch, timesteps/2, ffn_dim)
-        d2 = self.dl2(d1)                              # (batch, timesteps/2, layer_dim)
+        d1 = self.dl1(r1)                                      # (batch, timesteps/2, ffn_dim)
+        d2 = self.dl2(d1)                                      # (batch, timesteps/2, layer_dim)
         # dropout
-        p2 = self.dr2(d2, training=training)           # (batch, timesteps/2, layer_dim)
+        p2 = self.dr2(d2, training=training)                   # (batch, timesteps/2, layer_dim)
         # a residual connection from n1 is not possible due to the timestep halving
         # norm
-        n2 = self.nl2(p2)                              # (batch, timesteps/2, layer_dim)
+        n2 = self.nl2(p2)                                      # (batch, timesteps/2, layer_dim)
         #
         return n2, rmask # (batch, timesteps/2, layer_dim), (batch, timesteps/2)
 
-
-
+    
 class PyramidalTransformer(keras.layers.Layer):
-    def __init__(self, nlayers, nheads, trans_dim, ffn_dim, dropout_rate, max_len, **kwargs):
+    def __init__(self, nlayers, nheads, tran_dim, ffn_dim, dropout_rate, max_frames, mel_dim, **kwargs):
         super(PyramidalTransformer, self).__init__(**kwargs)
         # store parameters
         self.nlayers      = nlayers
         self.nheads       = nheads
-        self.trans_dim    = trans_dim
+        self.tran_dim     = tran_dim
         self.ffn_dim      = ffn_dim
         self.dropout_rate = dropout_rate
-        self.max_len      = max_len
-        # positional encoding tensor, shape (max_len, trans_dim)
+        self.max_frames   = max_frames
+        self.mel_dim      = mel_dim
+        # a pointwise embedding layer encodes logmels into tran_dim
+        self.eml   = layers.Dense(tran_dim)
+        # positional encoding tensor, shape (max_frames, tran_dim)
         self.pet   = self.compute_pet()
         # learnable input scaling variable
         self.scale = tf.Variable(0.05)
         # input dropout layer
-        self.idr   = layers.Dropout(dropout_rate)
-        # list of TransformerLayers
-        self.lays  = [PyramidalTransformerLayer(nheads, trans_dim, ffn_dim, dropout_rate)
+        self.idl   = layers.Dropout(dropout_rate)
+        # input layer norm
+        self.iln   = layers.LayerNormalization()
+        # list of PyramidalTransformerLayers
+        self.lays  = [PyramidalTransformerLayer(nheads, tran_dim, ffn_dim, dropout_rate)
                       for _ in range(nlayers)]
     #
     def call(self, inputs, mask, training):
-        # inputs    (batch, timesteps, trans_dim)
-        # mask      (batch, timesteps)
+        # inputs    (batch, frames, mel_dim)
+        # mask      (batch, frames)
         # training  Python boolean specifying whether the layer is training
         #
-        # scale the input to enable it to compete with the positional encoding
-        # the scale is learnable, with initial value sqrt(trans_dim) chosen for Embedded inputs
-        sci = inputs * tf.sqrt(tf.cast(self.trans_dim, tf.float32)) * 20.0 * self.scale
-        # add the positional encoding, broadcasting over batch
+        # embed the logmels in tran_dim dimensions -> (batch, frames, tran_dim)
+        emi = self.eml(inputs)
+        # scale the embedded inputs to enable them to compete with the positional encoding
+        # the scale is learnable, with initial value sqrt(tran_dim / mel_dim)
+        sci = emi * tf.sqrt(self.tran_dim / self.mel_dim) * 20.0 * self.scale
+        # add the positional encoding, broadcasting over batch, (batch, frames, tran_dim)
         ips = sci + self.pet[0:tf.shape(inputs)[1]]
-        # apply dropout to produce the transformer layer input, (batch, timesteps, trans_dim)
-        x = self.idr(ips, training=training)
+        # apply dropout to the sum,                             (batch, frames, tran_dim)
+        idr = self.idl(ips, training=training)
+        # normalize to produce the transformer layer input,     (batch, frames, tran_dim)
+        x   = self.iln(idr)
         # apply the pyramidal transformer layers, each layer halving the timesteps
         for i in range(self.nlayers):
             x, mask = self.lays[i](x, mask, training)
         # pd is the pyramid downsampling, 2**nlayers
-        return x, mask # (batch, timesteps/pd, trans_dim), (batch, timesteps/pd)
+        return x, mask # (batch, frames/pd, tran_dim), (batch, frames/pd)
     #
     def compute_pet(self):
         # compute positional encoding tensor
-        pos = np.array(range(self.max_len))
+        pos = np.array(range(self.max_frames))
         pel = []
-        for d in range(self.trans_dim):
+        for d in range(self.tran_dim):
             if d % 2 == 0:
-                row = np.sin(pos/(10000**(d/self.trans_dim)))
+                row = np.sin(pos/(10000**(d/self.tran_dim)))
             else:
-                row = np.cos(pos/(10000**((d-1)/self.trans_dim)))
+                row = np.cos(pos/(10000**((d-1)/self.tran_dim)))
             pel.append(row)
-        # pea has shape (max_len, trans_dim)
+        # pea has shape (max_frames, tran_dim)
         pea = np.array(pel).T
         pet = tf.convert_to_tensor(pea, dtype=tf.float32)
         return pet
 
 
 class Listener(keras.layers.Layer):
-    def __init__(self, lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_len, **kwargs):
+    def __init__(self, lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_frames, mel_dim, **kwargs):
         super(Listener, self).__init__(**kwargs)
-        # store parameters
-        self.lis_layers   = lis_layers
-        self.lis_dim      = lis_dim
-        self.ffn_dim      = ffn_dim
-        self.nheads       = nheads
-        self.dropout_rate = dropout_rate
-        self.max_len      = max_len
-        # for backwards compatibility all representation dimensions are lis_dim*2
-        self.rep_dim = lis_dim*2
-        # a pointwise embedding layer encodes logmels into rep_dim
-        self.dem = layers.Dense(self.rep_dim)
+        # for backwards compatibility the transformer dim is lis_dim*2
+        self.tran_dim = lis_dim*2
         # the PyramidalTransformer encoder
-        self.pte = PyramidalTransformer(lis_layers, nheads, self.rep_dim, ffn_dim, dropout_rate, max_len)
+        self.pte = PyramidalTransformer(lis_layers, nheads, self.tran_dim, ffn_dim, dropout_rate,
+                                        max_frames, mel_dim)
         #
     def call(self, inputs, mask, training):
         # input  (batch, frames, mel_dim)
         # mask   (batch, frames)
-        # 
-        # embed the logmels in rep_dim dimensions -> (batch, frames, rep_dim)
-        x = self.dem(inputs)
+        #
         # apply the PyramidalTransformer encoder
-        h, hmask = self.pte(x, mask, training)
+        h, hmask = self.pte(inputs, mask, training)
         # pd is the pyramid downsampling, 2**lis_layers
         return h, hmask # (batch, frames/pd, lis_dim*2) and hmask = (batch, frames/pd)
 
 
-    
+
 # The Test Model exists as a sanity check on everything up to here.
 # It predicts speaker_id from logmels.
 class TestModel(keras.Model):
     """To predict speaker_ids from logmels"""
-    def __init__(self, lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_len, num_speakers, **kwargs):
+    def __init__(self, lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_frames, mel_dim,
+                 num_speakers, **kwargs):
         super(TestModel, self).__init__(**kwargs)
-        self.listener = Listener(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_len)
+        self.listener = Listener(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_frames, mel_dim)
         self.condenser = layers.LSTM(lis_dim, return_sequences=False)
-        self.dense  = layers.Dense(num_speakers)
+        self.dense = layers.Dense(num_speakers)
     def call(self, inputs, training):
         # models passed to fit() can only have one positional argument plus 'training'
         logmels, logmel_mask = inputs
@@ -439,23 +498,22 @@ class TestModel(keras.Model):
 # Calling fit() on the test model:
 #
 # instantiate the test model
-# tmodel = TestModel(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_len, 20000)
+# tmodel = TestModel(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_frames, mel_dim, 20000)
 # tmodel.compile(
 #     optimizer=keras.optimizers.RMSprop(1e-3),
 #     loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
 #     metrics=[tf.keras.metrics.SparseCategoricalAccuracy()]
 # )
-# using fit requires a dataset structured as (inputs, outputs)
+# using fit requires a simpler dataset structured as (inputs, outputs)
 # def tmap(d):
 #     return (d['logmels'], d['logmel_mask']), (d['speaker_id'],)
 # 
-# 
 # test_ds = mask_ds.map(tmap)
 # history = tmodel.fit(test_ds, epochs=1)
-# 
-# This works, but it needs a batch_size of 4 with PyramidalTransformers.
+#
+# This works, but batch_size has to be 4 with PyramidalTransformers.
 
-
+awl = []
 
 # Attention can't be done as a layer, because attention ci is computed from si which isn't available
 # until you've run the decoder RNN to compute it from step i-1.  In other words, the attention
@@ -469,7 +527,7 @@ class DecoderCell(keras.layers.Layer):
         super(DecoderCell, self).__init__(**kwargs)
         # dec_dim will be the dimension of the DecoderCell's internal LSTMs
         self.dec_dim = dec_dim
-        # att_dim is used to construct the MLPs used to compute attention queries and keys
+        # att_dim is used to construct the MLP used to compute attention queries
         self.att_dim = att_dim
         # lis_dim is the LSTM dimension in the listener pyramid
         self.lis_dim = lis_dim
@@ -478,42 +536,46 @@ class DecoderCell(keras.layers.Layer):
         # fraction of the time we should use the previous y prediction for y input
         self.frac_pyp = frac_pyp
         # call states are [memory, carry] tensors x2 for the internal LSTMs, all shaped (batch, dec_dim),
-        # plus previous s vector (batch, dec_dim), previous context vector, (batch, lis_dim*2),
+        # plus previous s vector (batch, dec_dim), previous context vector (batch, lis_dim*2),
+        # previous mean attention index (batch, 1), previous monotonicity loss (batch, 1),
         # and previous y prediction (batch, voc_dim)
         self.state_size = [tf.TensorShape([dec_dim]), tf.TensorShape([dec_dim]),
                            tf.TensorShape([dec_dim]), tf.TensorShape([dec_dim]),
                            tf.TensorShape([dec_dim]), tf.TensorShape([lis_dim*2]),
+                           tf.TensorShape([1])      , tf.TensorShape([1]),
                            tf.TensorShape([voc_dim])]
         # output size is a yp tensor, shape (batch, voc_dim)
         self.output_size = tf.TensorShape([voc_dim])
         # the LSTMs to be used in the DecoderCell
         self.lstm_cell1 = layers.LSTMCell(self.dec_dim)
         self.lstm_cell2 = layers.LSTMCell(self.dec_dim)
-        # the phi attention MLP
+        # the phi attention MLP used to compute queries
         self.phi1 = layers.Dense(att_dim * 2, activation='relu')
         self.phi2 = layers.Dense(att_dim)
-        # the psi attention MLP
-        self.psi1 = layers.Dense(att_dim * 2, activation='relu')
-        self.psi2 = layers.Dense(att_dim)
         # the chr character distribution MLP
         self.chr1 = layers.Dense(voc_dim * 4, activation='relu')
         self.chr2 = layers.Dense(voc_dim)
+        # the attention layer, with scale variable
+        self.att  = layers.Attention(use_scale=True)
         #
     def call(self, input_at_t, states_at_t, training, constants=None):
         #
         # input_at_t should be the 1-hot ground truth character vector at timestep i-1
         yin = input_at_t      # shape (batch, voc_dim)
-        # states_at_t should be [memory, carry]x2 [psv, pcv, pyp] tensors, see state_size above
-        pmc1 = states_at_t[0:2] # previous memory and carry for internal LSTM 1
-        pmc2 = states_at_t[2:4] # previous memory and carry for internal LSTM 2
-        psv  = states_at_t[4]   # previous s vector, shape (batch, dec_dim)
-        pcv  = states_at_t[5]   # previous context vector, shape (batch, lis_dim*2)
-        pyp  = states_at_t[6]   # previous y prediction, shape (batch, voc_dim) (as logits)
-        # training is a Python boolean used to control dropout, which is not used in this layer
+        # states_at_t should be [memory, carry]x2 [psv, pcv, pmai, ploss, pyp] tensors, see state_size above
+        pmc1  = states_at_t[0:2] # previous memory and carry for internal LSTM 1
+        pmc2  = states_at_t[2:4] # previous memory and carry for internal LSTM 2
+        psv   = states_at_t[4]   # previous s vector, shape (batch, dec_dim)
+        pcv   = states_at_t[5]   # previous context vector, shape (batch, lis_dim*2)
+        pmai  = states_at_t[6]   # previous mean attention index, shape (batch, 1)
+        ploss = states_at_t[7]   # previous monotonicity loss, shape (batch, 1)
+        pyp   = states_at_t[8]   # previous y prediction, shape (batch, voc_dim) (as logits)
+        # training is a Python boolean usually used to control dropout but used here to control logging
         # constants is a keyword argument that can be passed to RNN.__call__() which contains constants:
         listener_features = constants[0] # shape (batch, frames/pd, lis_dim*2)
-        listener_mask     = constants[1] # shape (batch, frames/pd)
-        blend             = constants[2] # shape () tf.bool
+        listener_keys     = constants[1] # shape (batch, frames/pd, att_dim)
+        listener_mask     = constants[2] # shape (batch, frames/pd)
+        blend             = constants[3] # shape () tf.bool
         #
         # When blending inputs the y to use (ytu) is produced as either yin (teacher-forcing) or a
         # sample drawn from the previous y prediction (pyp) distribution (to improve model robustness).
@@ -542,17 +604,40 @@ class DecoderCell(keras.layers.Layer):
         # Reshape m2 into the query, shape (batch, 1, att_dim)
         query = layers.Reshape((1, self.att_dim))(m2)
         #
-        # Apply the psi attention MLP to the listener features to get the key, (batch, frames/pd, att_dim)
-        l1  = self.psi1(listener_features)
-        key = self.psi2(l1)
-        #
-        # Compute attention context vector ci with argument [query, value, key]
-        # This should yield shape (batch, 1, lis_dim*2)
-        c1 = layers.Attention()([query, listener_features, key], mask=[None, listener_mask])
-        #
-        # Reshape c1 to produce (batch, lis_dim*2)
-        ci = layers.Reshape((-1,))(c1)
-        #
+        # Compute the attention weights.
+        # TF2.3.0 layers.Attention() does not have an option to return attention weights.
+        # However, it can be tricked into returning them by sending an identity matrix as value.
+        # Prepare identity tensor (1, frames, frames); the 1 will broadcast over batch
+        frames = tf.shape(listener_features)[1]
+        it     = tf.keras.initializers.Identity()(shape=(frames, frames))[None,:,:]
+        # compute the attention weights (batch, 1, frames)
+        aw     = self.att([query, it, listener_keys], mask=[None, listener_mask])
+        # compute new context vector (batch, lis_dim*2)
+        ci     = tf.matmul(aw, listener_features)[:,0,:]
+        # squeeze out the 1 from the attention weights, (batch, frames)
+        saw    = aw[:,0,:]
+        # compute the new mean attention index
+        rt     = tf.range(frames, dtype=tf.float32)[None, :]           # (1, frames)
+        nmai   = tf.reduce_sum(saw * rt, axis=-1, keepdims=True)       # (batch, 1)
+        # compute monotonicity loss tensor when new mai is less than previous mai, (batch, 1)
+        # the capped L1 loss acts to discourage reversals without preventing it completely during learning
+        losst  = tf.minimum(tf.abs(nmai - pmai), 1.0) * tf.cast((nmai < pmai), tf.float32)
+        # add a capped L1 reward when new mai is more than previous mai, (batch, 1)
+        # the reward encourages small forward movements; it could be phased out after bootstrapping
+        losst -= tf.minimum(tf.abs(nmai - pmai), 1.0) * tf.cast((nmai > pmai), tf.float32)
+        # compute a y mask where 0 is a pad, (batch, 1)
+        ymask  = tf.reduce_sum(yin, axis=-1, keepdims=True)
+        # the losses are only valid where yin is not a pad, (batch, 1)
+        mloss  = ymask * losst
+        # compute the new monotonicity loss as a running total (batch, 1)
+        nloss  = mloss + ploss
+        # if training is False log the attention weights
+        if training == False:
+            # only for the 0th member of the batch (frames,)
+            oaw = saw[0,:]
+            # this append wont do anything useful under tf.function()
+            # this utility must be called without using tf.function()
+            awl.append(oaw)
         # concatenate si and ci to produce (batch, dec_dim + lis_dim*2)
         sc = layers.concatenate([si,ci])
         #
@@ -562,27 +647,58 @@ class DecoderCell(keras.layers.Layer):
         #
         # return outputs at time t, states at time t+1
         # see https://www.tensorflow.org/api_docs/python/tf/keras/layers/RNN
-        return yp, nmc1 + nmc2 + [si] + [ci] + [yp]
+        return yp, nmc1 + nmc2 + [si] + [ci] + [nmai] + [nloss] + [yp]
     # The cell could also define a get_initial_state() method, but it doesn't.
     # That means the rnn will feed zeros to call() for the initial state instead.
 
 
-# The Listen (now Pyramidal Transformer) Attend Spell Model
+# The Listen Attend Spell Model
 class LASModel(keras.Model):
-    def __init__(self, lis_dim, ffn_dim, lis_layers, nheads, dropout_rate, max_len, dec_dim, att_dim, voc_dim, frac_pyp, max_dec, **kwargs):
+    def __init__(self, lis_dim, ffn_dim, lis_layers, dec_dim, att_dim, voc_dim, frac_pyp, max_dec,
+                 max_frames, mel_dim, mloss_wt, nheads, dropout_rate, **kwargs):
         super(LASModel, self).__init__(**kwargs)
+        # monotonicity loss weight hyperparameter
+        self.mloss_wt = mloss_wt
         # maximum number of characters to decode in the decode() function
         self.max_dec  = max_dec
         # DecoderCell parameters required in the decode() function
         self.lis_dim  = lis_dim
         self.dec_dim  = dec_dim
         self.voc_dim  = voc_dim
+        # record for debugging
+        self.ffn_dim      = ffn_dim
+        self.lis_layers   = lis_layers
+        self.frac_pyp     = frac_pyp
+        self.att_dim      = att_dim
+        self.max_frames   = max_frames
+        self.mel_dim      = mel_dim
+        self.nheads       = nheads
+        self.dropout_rate = dropout_rate
         # the listener
-        self.listener = Listener(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_len)
+        self.listener = Listener(lis_layers, lis_dim, ffn_dim, nheads, dropout_rate, max_frames, mel_dim)
+        # the psi attention MLP used to compute the listener keys
+        self.psi1     = layers.Dense(att_dim * 2, activation='relu')
+        self.psi2     = layers.Dense(att_dim)
         # the decoder cell and rnn
         self.cell     = DecoderCell(dec_dim, att_dim, lis_dim, voc_dim, frac_pyp)
-        self.rnn      = layers.RNN(self.cell, return_sequences=True)
+        self.rnn      = layers.RNN(self.cell, return_sequences=True, return_state=True)
         #
+    def listen(self, logmels, logmel_mask, training):
+        # The listen() function computes the listener representation, keys and mask.
+        #
+        # compute the listener representation h and its mask
+        h, hmask = self.listener(logmels, logmel_mask, training)
+        # h           shape (batch, frames/pd, lis_dim*2)
+        # hmask       shape (batch, frames/pd)
+        #
+        # apply the psi attention MLP to get the listener keys
+        l1   = self.psi1(h)
+        l2   = self.psi2(l1)
+        # apply a 1/sqrt(model_dim) scaling here in lieu of one in the Attention() layer
+        hkey = l2 / np.sqrt(self.att_dim)
+        # hkey        shape (batch, frames/pd, att_dim)
+        return h, hkey, hmask
+    #
     def call(self, inputs, training):
         # keras models like all their inputs in the first argument
         yins, ymask, logmels, logmel_mask, blend = inputs
@@ -595,15 +711,26 @@ class LASModel(keras.Model):
         # blend       shape () tf boolean
         # training    Python boolean
         #
-        # compute the listener representation h and its mask
-        h, hmask = self.listener(logmels, logmel_mask, training)
+        # compute the listener representation, key and mask
+        h, hkey, hmask = self.listen(logmels, logmel_mask, training)
         # h           shape (batch, frames/pd, lis_dim*2)
+        # hkey        shape (batch, frames/pd, att_dim)
         # hmask       shape (batch, frames/pd)
         #
-        # Compute the y predictions as softmax logits.
-        # Since y is post-padded and masked outputs are not used the ymask is optional here.
-        yps = self.rnn(yins, mask=ymask, training=training, constants=[h, hmask, blend])
-        # yps          shape (batch, nchars, voc_dim)
+        # Compute the y predictions as softmax logits, and the last cell state.
+        # Now that I return the last state the ymask is needed here; pads cause state to be copied forward. 
+        r = self.rnn(yins, mask=ymask, training=training, constants=[h, hkey, hmask, blend])
+        #
+        yps   = r[0] # y predictions,     shape (batch, nchars, voc_dim)
+        mloss = r[8] # monotonicity loss, shape (batch, 1)
+        #
+        # divide out the number of positions that contributed to mloss, (batch, 1)
+        mloss /= tf.reduce_sum(tf.cast(ymask, tf.float32))
+        # scale the monotonicity loss tensor using its hyperparameter, (batch, 1)
+        mloss *= self.mloss_wt
+        # add the monotinicity loss
+        # adding this loss inside DecoderCell causes an InaccessibleTensorError at runtime
+        self.add_loss(tf.reduce_sum(mloss))
         #
         return yps
     #
@@ -613,24 +740,27 @@ class LASModel(keras.Model):
         # logmels     shape (batch, frames, mel_dim)
         # logmel_mask shape (batch, frames)
         #
-        # where this funcion expects batch = 1
+        # where this function expects batch = 1
         tf.debugging.assert_equal(tf.shape(logmels)[0],     1, message="las.decode() expects batch_size 1")
         tf.debugging.assert_equal(tf.shape(logmel_mask)[0], 1, message="las.decode() expects batch_size 1")
         #
-        # compute the listener representation h and its mask
-        h, hmask = self.listener(logmels, logmel_mask, training=False)        
-        # h           shape (1, frames/pd, lis_dim*2)
-        # hmask       shape (1, frames/pd)
+        # compute the listener representation, key and mask
+        # training is False to switch off dropout
+        h, hkey, hmask = self.listen(logmels, logmel_mask, training=False)
+        # h           shape (batch, frames/pd, lis_dim*2)
+        # hkey        shape (batch, frames/pd, att_dim)
+        # hmask       shape (batch, frames/pd)
         #
         # the DecoderCell should not blend its inputs when decoding
         blend    = tf.constant(False)
         # the <sos> token is always the first input
         sos_text = b'^'
-        sos_code = tf.strings.unicode_decode(sos_text,'utf-8')
-        yin      = tf.one_hot(sos_code, self.voc_dim)            # (1, voc_dim)
+        sos_code = tf.strings.unicode_decode(sos_text,'utf-8')    # (1,)
+        # the [0] subscript defining yin tells tf.function() that yin has leading dimension 1
+        yin      = tf.one_hot(sos_code, self.voc_dim)[0][None,:]  # (1, voc_dim)
         # the <eos> token tells us when to stop decoding
         eos_text = b'$'
-        eos_code = tf.strings.unicode_decode(eos_text,'utf-8')
+        eos_code = tf.strings.unicode_decode(eos_text,'utf-8')    # (1,)
         # use TensorArray to accumulate a sparse array of unknown size of decoded int32s
         dec_ta   = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=True)
         dec_i    = 0
@@ -638,16 +768,17 @@ class LASModel(keras.Model):
         istate   = [tf.zeros((1, self.dec_dim)), tf.zeros((1, self.dec_dim)),
                     tf.zeros((1, self.dec_dim)), tf.zeros((1, self.dec_dim)),
                     tf.zeros((1, self.dec_dim)), tf.zeros((1, self.lis_dim*2)),
+                    tf.zeros((1, 1))           , tf.zeros((1, 1)),
                     tf.zeros((1, self.voc_dim))]
         state    = istate
         # initial y decoded (for loop comparisons)
-        yd       = sos_code
+        yd       = sos_code # (1,)
         # prepare while loop functions
         def cond(yin, state, yd, dec_ta, dec_i):
             return yd != eos_code
         #
         def body(yin, state, yd, dec_ta, dec_i):
-            yp, state = self.cell(yin, state, training=False, constants=[h, hmask, blend])
+            yp, state = self.cell(yin, state, training=False, constants=[h, hkey, hmask, blend])
             # yp shape (1, voc_dim)
             #
             # in this simple decoder the most likely character becomes the decoded char for this timestep
@@ -670,18 +801,20 @@ class LASModel(keras.Model):
 
 
 # instantiate the model
-las=LASModel(lis_dim,ffn_dim,lis_layers,nheads,dropout_rate,max_len,dec_dim,att_dim,voc_dim,frac_pyp,max_dec)
+las = LASModel(lis_dim, ffn_dim, lis_layers, dec_dim, att_dim, voc_dim, frac_pyp, max_dec, max_frames,
+               mel_dim, mloss_wt, nheads, dropout_rate)
 
 
 # optimizer
-# Preliminary experiments have shown that a learning rate of 1e-3 is optimal for the first 1000
-# batches of training.  LAS experiments staircased to 0.7 every 1/3 epoch, and I do that here too.
+# Preliminary experiments have shown that a learning rate of 1e-3 is optimal for the first
+# 1000 batches of training.  LAS experiments staircased to 0.7 after approx every epoch, and
+# I do that here too.
 
 initial_learning_rate = 1e-3
 
 lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
     initial_learning_rate,
-    decay_steps=28368//(3 * batch_size),
+    decay_steps=28368//batch_size,
     decay_rate=0.7,
     staircase=True)
 
@@ -699,7 +832,7 @@ val_acc    = tf.keras.metrics.Mean()
 # loss function
 loss_object = tf.keras.losses.CategoricalCrossentropy(from_logits=True, reduction='none')
 
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def loss_function(tars, mask, logits):
     # losses due to pads must not be counted
     lt   = loss_object(tars, logits)         # (batch, nchars)
@@ -709,7 +842,7 @@ def loss_function(tars, mask, logits):
 
 
 # accuracy function
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def acc_function(tars, mask, logits):
     # accuracies of pads must not be counted
     preds = tf.argmax(logits, axis=-1)       # (batch, nchars)
@@ -736,7 +869,7 @@ signature_dict = { 'logmels'     : tf.TensorSpec(shape=(None, None, mel_dim), dt
 
 
 @tf.function(input_signature = [signature_dict])
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def train_step(d):
     # ygt is ground truth chars, including start and end characters
     ygt        = d['ygt']         # (batch, nchars, voc_dim)
@@ -746,21 +879,24 @@ def train_step(d):
     yins_mask  = ygt_mask[:, :-1] # (batch, nchars)
     # y targets exclude the start character
     ytars      = ygt[:, 1:]       # (batch, nchars, voc_dim)
-    ytars_mask = ygt_mask[:, 1:]  # (batch, nchars)
+    ytars_mask = ygt_mask[:, 1:]  # (batch, nchars) 
     # training blends ground truth inputs with predictions
     blend = tf.constant(True)
-    #
+    # the training boolean is set to True to use dropout in the Transformer listener
     with tf.GradientTape() as tape:
         # call the model to obtain the y predictions (logits) (batch, nchars, voc_dim)
         yps = las([yins, yins_mask, d['logmels'], d['logmel_mask'], blend], training=True)
         # compute the loss
         loss = loss_function(ytars, ytars_mask, yps)
+        # add the monotonicity loss
+        loss += sum(las.losses)
+        # tf.print(sum(las.losses))
     #
     # compute and apply the gradients
     gradients = tape.gradient(loss, las.trainable_variables)
     # clip gradients to stabilize training
-    # with batch_size=4 only about one batch in a hundred has gradient norm over 3.0
-    gradients, gn = tf.clip_by_global_norm(gradients, 3.0)
+    # with batch_size=4 gradient norms are only rarely over 2.0 after 200 batches
+    gradients, gn = tf.clip_by_global_norm(gradients, 2.0)
     # tf.print(gn, tf.linalg.global_norm(gradients))
     optimizer.apply_gradients(zip(gradients, las.trainable_variables))
     # accumulate
@@ -769,7 +905,7 @@ def train_step(d):
 
 
 @tf.function(input_signature = [signature_dict])
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def val_step(d):
     # ygt is ground truth chars, including start and end characters
     ygt        = d['ygt']         # (batch, nchars, voc_dim)
@@ -779,28 +915,34 @@ def val_step(d):
     yins_mask  = ygt_mask[:, :-1] # (batch, nchars)
     # y targets exclude the start character
     ytars      = ygt[:, 1:]       # (batch, nchars, voc_dim)
-    ytars_mask = ygt_mask[:, 1:]  # (batch, nchars) 
+    ytars_mask = ygt_mask[:, 1:]  # (batch, nchars)
     # blend is True so that validation loss/acc are comparable to training loss/acc
     # similarly training is True so that dropout operation does not differ with training
     # (validation results are only useful comparatively since this is not the ultimate task)
     blend = tf.constant(True)
     # call the model to obtain the y predictions (logits) (batch, nchars, voc_dim)
     yps = las([yins, yins_mask, d['logmels'], d['logmel_mask'], blend], training=True)
+    # compute the target loss
+    loss = loss_function(ytars, ytars_mask, yps)
+    # add the monotonicity loss
+    loss += sum(las.losses)
+    # tf.print(sum(las.losses))
     # accumulate
-    val_loss(loss_function(ytars, ytars_mask, yps))
+    val_loss(loss)
     val_acc(acc_function(ytars, ytars_mask, yps))
 
 
 # I'll use the dev set as validation data
 dev_ds    = builder.as_dataset(split="dev_clean")
-dtr_ds    = dev_ds.map(transform)
-dfi_ds    = dtr_ds.filter(filter_lengths)
-dno_ds    = dfi_ds.map(normalize)
+dfi_ds    = dev_ds.filter(filter_lengths)
+dau_ds    = dfi_ds.map(wav_augment)
+dtr_ds    = dau_ds.map(transform)
+dno_ds    = dtr_ds.map(normalize)
 dpd_ds    = dno_ds.padded_batch(
     batch_size,
     padded_shapes=({'logmels' : (None, mel_dim), 'speaker_id' : (), 'ygt' : (None, voc_dim)}))
 dmk_ds    = dpd_ds.map(gen_masks)
-# I'll validate on about 512 utterances, which should take about 2 minutes
+# I'll validate on about 512 utterances
 val_steps = 512 // batch_size
 
 
@@ -877,10 +1019,18 @@ for epoch in range(num_epochs):
 status = checkpoint.restore(tf.train.latest_checkpoint(checkpoint_directory))
 status.assert_consumed()
 
+# set up a new dev_clean data pipeline with no wav_augment and batch_size=4
+dtr_ds    = dfi_ds.map(transform)
+dno_ds    = dtr_ds.map(normalize)
+dpd_ds    = dno_ds.padded_batch(
+    batch_size=4,
+    padded_shapes=({'logmels' : (None, mel_dim), 'speaker_id' : (), 'ygt' : (None, voc_dim)}))
+dmk_ds    = dpd_ds.map(gen_masks)
+
 # First, look at model predictions when teacher-forcing each input character.
 
 @tf.function(input_signature = [signature_dict])
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def pred_step(d):
     # ygt is ground truth chars, including start and end characters
     ygt        = d['ygt']         # (batch, nchars, voc_dim)
@@ -892,14 +1042,15 @@ def pred_step(d):
     ytars      = ygt[:, 1:]       # (batch, nchars, voc_dim)
     ytars_mask = ygt_mask[:, 1:]  # (batch, nchars)
     # blend is False since we want to always use the teacher-forced input char
-    blend = tf.constant(False)
+    blend      = tf.constant(False)
     # call the model to obtain the y predictions (logits) (batch, nchars, voc_dim)
+    # set training to False to switch off dropout; this will write junk to awl
     yps = las([yins, yins_mask, d['logmels'], d['logmel_mask'], blend], training=False)
     return yps, ytars, ytars_mask
 
 
 
-# Produce predictions for a single batch
+# Produce predictions for 1 batch
 print('Predictions when teacher-forcing each input character:\n')
 for i, d in enumerate(dmk_ds):
     # get the predictions, as logits
@@ -930,14 +1081,14 @@ signature_list = [ tf.TensorSpec(shape=(1, None, mel_dim), dtype=tf.float32),
                    tf.TensorSpec(shape=(1, None),          dtype=tf.bool) ]
 
 @tf.function(input_signature = signature_list)
-# @tf.autograph.experimental.do_not_convert
+@tf.autograph.experimental.do_not_convert
 def decode_step(logmels, logmel_mask):
     # call the model to obtain the decoded text
     dec_text = las.decode(logmels, logmel_mask)
     return dec_text
 
 
-# Produce predictions for a single batch
+# Produce predictions for 4 examples
 print('Predictions as pure decodings, starting from <sos>:\n')
 for i, d in enumerate(dmk_ds.unbatch().batch(1)):
     logmels     = d['logmels']                      # (1, frames, mel_dim)
@@ -963,6 +1114,54 @@ for i, d in enumerate(dmk_ds.unbatch().batch(1)):
     print('decoded', dec_text.numpy())
     print('target ', tar_text.numpy()[:length.numpy()])
     print('\n')
-    if i == (batch_size-1):
+    if i == 3:
         break
+
+
+
+# Third, look at speller-listener attention weights when teacher-forcing each character
+def att_step(d):
+    # ygt is ground truth chars, including start and end characters
+    ygt        = d['ygt']         # (batch, nchars, voc_dim)
+    ygt_mask   = d['ygt_mask']    # (batch, nchars)
+    # y inputs exclude end character
+    yins       = ygt[:, :-1]      # (batch, nchars, voc_dim)
+    yins_mask  = ygt_mask[:, :-1] # (batch, nchars)
+    # y targets exclude the start character
+    ytars      = ygt[:, 1:]       # (batch, nchars, voc_dim)
+    ytars_mask = ygt_mask[:, 1:]  # (batch, nchars)
+    # blend is False since we want to always use the teacher-forced input char
+    blend      = tf.constant(False)
+    # training is False to switch off dropout and switch on the attention weight logging code
+    # call the model to obtain the y predictions (logits) (batch, nchars, voc_dim)
+    yps = las([yins, yins_mask, d['logmels'], d['logmel_mask'], blend], training=False)
+    return yps, ytars, ytars_mask
+
+
+# set up a new dev_clean data pipeline with no wav_augment and batch_size=1
+dtr_ds    = dfi_ds.map(transform)
+dno_ds    = dtr_ds.map(normalize)
+dba_ds    = dno_ds.batch(1)
+dmk_ds    = dba_ds.map(gen_masks)
+# extract second validation data example ("horses")
+for i,d in enumerate(dmk_ds):
+    if i == 1:
+        break
+
+# call att_step(), collecting useful output in awl
+awl     = []
+_, _, _ = att_step(d)
+awa     = tf.convert_to_tensor(awl).numpy()
+awa.shape
+# should be (74, 472) : 74 characters, 472 reps
+
+import matplotlib.pyplot as plt
+plt.imshow(awa, cmap='Greys')
+plt.colorbar(location='bottom')
+plt.ylabel('characters')
+plt.xlabel('speech representation timesteps')
+plt.title('Decoder attention weights for the validation data utterance\n'
+          '"anyway he would never allow one of his horses to be put to such a strain"\n\n')
+plt.tight_layout()
+plt.show()
 

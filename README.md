@@ -1,6 +1,8 @@
 # Pyramidal-Transformer
 <B>Research</B>
 
+Under construction...
+
 <a href="https://arxiv.org/abs/1508.01211">Listen, Attend and Spell</a> was published in 2015, before the invention of the Transformer, and so it is natural to wonder whether using a Transformer encoder in place of the bidirectional LSTM encoder in the Listener would be helpful; doubly so since I read <a href="https://arxiv.org/abs/1910.09799">Wang, et al. 2020</a> which found Transformer encoders to be useful in Hybrid systems.
 
 <P>
